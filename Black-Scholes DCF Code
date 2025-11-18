@@ -1,0 +1,791 @@
+"""
+Dash DCF + Black‑Scholes KPI Dashboard
+
+Features
+- User enters a stock ticker (e.g., AAPL, MSFT, TSLA) and clicks "Run Analysis".
+- Pulls market data & financials via yfinance.
+- Computes:
+  • DCF (based on historical Free Cash Flow with user‑controlled assumptions)
+  • Black‑Scholes (call/put prices using estimated or user‑overridden inputs)
+  • KPIs: Current Price, DCF Value/Share, Upside %, Annualized Volatility, BS Call/Put
+- Visuals:
+  • Price history
+  • Forecast FCF & discounted FCF (DCF)
+  • Monte‑Carlo distribution of future price (GBM/Black‑Scholes dynamics)
+  • Option payoff at expiry
+
+Install
+pip install dash==2.* yfinance pandas numpy scipy plotly
+
+Run
+python app.py
+
+Notes
+- Internet is required at runtime for live data.
+- DCF uses Free Cash Flow (FCF). yfinance’s 'FreeCashFlow' is generally Free Cash Flow to Equity (FCFE).
+- If FCF is missing, the app estimates FCF = CFO - CapEx when available.
+- All sliders/inputs have sensible defaults; adjust to taste.
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from scipy.stats import norm
+from plotly.subplots import make_subplots
+
+# -------------------------------
+# Indicator helpers (TradingView-style)
+# -------------------------------
+
+def sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n).mean()
+
+
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/n, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/n, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def macd_series(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def bbands(close: pd.Series, n: int = 20, k: float = 2.0):
+    ma = sma(close, n)
+    sd = close.rolling(n).std()
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return ma, upper, lower
+
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    tp = (df['High'] + df['Low'] + df['Close']) / 3.0
+    cum_pv = (tp * df['Volume']).cumsum()
+    cum_v = df['Volume'].replace(0, np.nan).cumsum()
+    return cum_pv / cum_v
+
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    prev_close = close.shift(1)
+    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, no_update
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+try:
+    import yfinance as yf
+except Exception as e:  # pragma: no cover
+    raise SystemExit("Please install yfinance: pip install yfinance")
+
+# -------------------------------
+# Utility models & math helpers
+# -------------------------------
+
+@dataclass
+class DCFResult:
+    per_share_value: Optional[float]
+    enterprise_value: Optional[float]
+    equity_value: Optional[float]
+    pv_fcfs: Optional[float]
+    pv_terminal: Optional[float]
+    fcf_forecast: pd.DataFrame
+    message: str = ""
+
+
+def ann_vol_from_history(prices: pd.Series, days: int = 252) -> Optional[float]:
+    if prices is None or len(prices) < 30:
+        return None
+    returns = np.log(prices / prices.shift(1)).dropna()
+    if returns.empty:
+        return None
+    daily_std = returns.std()
+    return float(daily_std * math.sqrt(252))
+
+
+def black_scholes(S: float, K: float, T: float, r: float, q: float, sigma: float) -> Tuple[float, float]:
+    """Return (call, put) using Black‑Scholes with continuous dividend yield q."""
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return (np.nan, np.nan)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    call = S * math.exp(-q * T) * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+    put = K * math.exp(-r * T) * norm.cdf(-d2) - S * math.exp(-q * T) * norm.cdf(-d1)
+    return float(call), float(put)
+
+
+def gbm_terminal_prices(S0: float, T: float, r: float, q: float, sigma: float, n: int = 10000, seed: Optional[int] = 42) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal(n)
+    drift = (r - q - 0.5 * sigma ** 2) * T
+    diff = sigma * math.sqrt(T) * z
+    ST = S0 * np.exp(drift + diff)
+    return ST
+
+
+def safe_pct(x: Optional[float]) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"{100*x:.2f}%"
+
+# -------------------------------
+# Auto-parameter helpers
+# -------------------------------
+
+def get_risk_free_rate(default: float = 0.04) -> float:
+    """Approximate risk-free from ^TNX (10y). Fallback to 4%."""
+    try:
+        tnx = yf.Ticker("^TNX")
+        h = tnx.history(period="5d")
+        if h is not None and not h.empty:
+            return float(h["Close"].iloc[-1] / 100.0)
+    except Exception:
+        pass
+    return float(default)
+
+
+def compute_beta_from_prices(asset: pd.Series, market: pd.Series) -> Optional[float]:
+    try:
+        df = pd.concat([asset, market], axis=1).dropna()
+        df.columns = ["S", "M"]
+        rets = np.log(df / df.shift(1)).dropna()
+        if len(rets) < 30:
+            return None
+        cov = np.cov(rets["S"], rets["M"])[0, 1]
+        var = np.var(rets["M"])
+        if var <= 0:
+            return None
+        return float(cov / var)
+    except Exception:
+        return None
+
+
+def estimate_fcf_growth_from_history(fcf: pd.Series, default: float = 0.05) -> float:
+    try:
+        s = fcf.sort_index()
+        yoy = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if yoy.empty:
+            return float(default)
+        g = float(np.median(yoy.tail(5)))
+        return float(np.clip(g, -0.20, 0.25))
+    except Exception:
+        return float(default)
+
+# -------------------------------
+# Data accessors
+# -------------------------------
+
+class YFClient:
+    def __init__(self, ticker: str):
+        self.ticker = ticker.upper().strip()
+        self.t = yf.Ticker(self.ticker)
+
+    def price_history(self, period: str = "5y") -> pd.Series:
+        hist = self.t.history(period=period)
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float)
+        return hist["Close"].dropna()
+
+    def ohlcv_history(self, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
+        df = self.t.history(period=period, interval=interval)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Open","High","Low","Close","Volume"]).astype(float)
+        cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+        return df[cols].dropna()
+
+    def last_price(self) -> Optional[float]:
+        try:
+            fi = getattr(self.t, "fast_info", None)
+            if fi is not None:
+                p = getattr(fi, "last_price", None)
+                if p:
+                    return float(p)
+        except Exception:
+            pass
+        try:
+            return float(self.t.history(period="1d")["Close"].iloc[-1])
+        except Exception:
+            return None
+
+    def dividend_yield(self) -> float:
+        dy = None
+        try:
+            info = self.t.get_info()
+            dy = info.get("dividendYield")
+        except Exception:
+            dy = None
+        if dy is None:
+            try:
+                div = self.t.dividends
+                if div is not None and not div.empty:
+                    last12 = div.iloc[-252:].sum() if len(div) > 252 else div.sum()
+                    p = self.last_price()
+                    if p and p > 0:
+                        dy = float(last12 / p)
+            except Exception:
+                dy = None
+        return float(dy) if dy is not None else 0.0
+
+    def shares_outstanding(self) -> Optional[float]:
+        try:
+            info = self.t.get_info()
+            for key in ("sharesOutstanding", "floatShares"):
+                v = info.get(key)
+                if v:
+                    return float(v)
+        except Exception:
+            pass
+        try:
+            fi = getattr(self.t, "fast_info", None)
+            if fi is not None:
+                v = getattr(fi, "shares", None)
+                if v:
+                    return float(v)
+        except Exception:
+            pass
+        return None
+
+    def free_cash_flows(self) -> pd.Series:
+        """Return yearly FCF series (most recent first). Robust to naming/shape changes."""
+        def _norm(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s) if ch.isalnum())
+
+        # Pull cashflow DF
+        cf = None
+        for attr in ("cashflow", "get_cashflow"):
+            try:
+                obj = getattr(self.t, attr)
+                cf = obj() if callable(obj) else obj
+                if isinstance(cf, pd.DataFrame) and not cf.empty:
+                    break
+            except Exception:
+                continue
+        if not isinstance(cf, pd.DataFrame) or cf.empty:
+            return pd.Series(dtype=float)
+
+        # Normalize index for robust row matching
+        cf_idx_map = {_norm(idx): idx for idx in cf.index}
+        candidates_fcf = [
+            "freecashflow", "freecashflows", "freecashflowstothefirm", "freecashflowstoequity",
+            "freecashflowfcf", "freecashflowtoequity"
+        ]
+        candidates_cfo = [
+            "totalcashfromoperatingactivities", "operatingcashflow",
+            "cashflowfromcontinuingoperatingactivities", "netcashprovidedbyoperatingactivities"
+        ]
+        candidates_capex = [
+            "capitalexpenditures", "capitalexpenditure", "capex", "investmentsincapitalexpenditures"
+        ]
+
+        # 1) Direct FCF row
+        for key in candidates_fcf:
+            if key in cf_idx_map:
+                s = cf.loc[cf_idx_map[key]].dropna()
+                if not s.empty:
+                    s.name = "FCF"
+                    return s
+
+        # 2) CFO - CapEx fallback
+        cfo_row = None
+        for key in candidates_cfo:
+            if key in cf_idx_map:
+                cfo_row = cf_idx_map[key]
+                break
+        capex_row = None
+        for key in candidates_capex:
+            if key in cf_idx_map:
+                capex_row = cf_idx_map[key]
+                break
+        if cfo_row and capex_row:
+            s = (cf.loc[cfo_row] - cf.loc[capex_row]).dropna()
+            if not s.empty:
+                s.name = "FCF"
+                return s
+
+        # 3) Orientation fallback: items in columns
+        norm_cols = {_norm(c): c for c in cf.columns}
+        for key in candidates_fcf:
+            if key in norm_cols:
+                s = cf[norm_cols[key]].dropna()
+                if not s.empty:
+                    s.name = "FCF"
+                    return s
+
+        return pd.Series(dtype=float)
+
+# -------------------------------
+# DCF engine
+# -------------------------------
+
+def dcf_valuation(
+    fcf_series: pd.Series,
+    wacc: float,
+    terminal_g: float,
+    forecast_years: int,
+    fcf_growth: Optional[float],
+    shares_out: Optional[float],
+) -> DCFResult:
+    msg = []
+    if fcf_series is None or fcf_series.empty:
+        return DCFResult(
+            per_share_value=None,
+            enterprise_value=None,
+            equity_value=None,
+            pv_fcfs=None,
+            pv_terminal=None,
+            fcf_forecast=pd.DataFrame(),
+            message="No FCF history available; DCF not computed.",
+        )
+
+    # Use the most recent annual FCF as base
+    # sort by date if possible (oldest->newest)
+    try:
+        idx = pd.to_datetime(fcf_series.index, errors="coerce")
+        fcf_series = pd.Series(fcf_series.values, index=idx).sort_index()
+    except Exception:
+        fcf_series = fcf_series.sort_index()  # chronological
+    fcf0 = float(fcf_series.iloc[-1])
+
+    # If no user growth provided, estimate a capped CAGR from history
+    if fcf_growth is None:
+        try:
+            first, last = float(fcf_series.iloc[0]), float(fcf_series.iloc[-1])
+            n = max(1, len(fcf_series) - 1)
+            cagr = (abs(last) / max(1e-9, abs(first))) ** (1 / n) - 1
+            # Cap in a reasonable band [-20%, +25%]
+            fcf_growth = float(np.clip(cagr * np.sign(np.mean(fcf_series)), -0.20, 0.25))
+            msg.append(f"Estimated FCF growth from history: {fcf_growth*100:.1f}%")
+        except Exception:
+            fcf_growth = 0.05
+            msg.append("Using default FCF growth = 5%.")
+
+    # Forecast and discount
+    years = list(range(1, forecast_years + 1))
+    fcfs = [fcf0 * ((1 + fcf_growth) ** t) for t in years]
+    disc_factors = [(1 / ((1 + wacc) ** t)) for t in years]
+    pv_fcfs = float(np.dot(fcfs, disc_factors))
+
+    fcfN = fcfs[-1] if fcfs else fcf0
+    if wacc <= terminal_g:
+        pv_terminal = np.nan
+        msg.append("Terminal growth must be less than WACC; terminal value omitted.")
+    else:
+        tv = fcfN * (1 + terminal_g) / (wacc - terminal_g)
+        pv_terminal = float(tv / ((1 + wacc) ** forecast_years))
+
+    equity_value = pv_fcfs + (pv_terminal if np.isfinite(pv_terminal) else 0.0)
+    per_share = (equity_value / shares_out) if shares_out and shares_out > 0 else None
+
+    fdf = pd.DataFrame({
+        "Year": years,
+        "FCF_Forecast": fcfs,
+        "Discount_Factor": disc_factors,
+        "PV_FCF": [fcfs[i] * disc_factors[i] for i in range(len(years))],
+    })
+
+    return DCFResult(
+        per_share_value=per_share,
+        enterprise_value=None,  # FCFE‑based DCF -> already equity value
+        equity_value=equity_value,
+        pv_fcfs=pv_fcfs,
+        pv_terminal=pv_terminal if np.isfinite(pv_terminal) else None,
+        fcf_forecast=fdf,
+        message="; ".join(msg),
+    )
+
+# -------------------------------
+# Dash app
+# -------------------------------
+
+app: Dash = dash.Dash(__name__)
+app.title = "DCF + Black‑Scholes Dashboard"
+
+card_style = {
+    "border": "1px solid #e5e7eb",
+    "borderRadius": "16px",
+    "padding": "16px",
+    "boxShadow": "0 2px 10px rgba(0,0,0,0.05)",
+    "background": "white",
+}
+
+label_style = {"fontWeight": 600, "marginBottom": "6px", "display": "block"}
+
+app.layout = html.Div(
+    style={"fontFamily": "Inter, system-ui, -apple-system, Segoe UI, Roboto", "padding": "20px", "background": "#f8fafc"},
+    children=[
+        html.Div(
+            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": 16},
+            children=[
+                html.Div([
+                    html.H2("DCF + Black‑Scholes KPI Dashboard", style={"margin": 0}),
+                    html.Div("Enter a ticker, set assumptions, then Run Analysis.", style={"color": "#64748b"}),
+                ]),
+                html.Div(
+                    style={"display": "flex", "gap": 8},
+                    children=[
+                        dcc.Input(id="ticker", type="text", placeholder="e.g., AAPL", value="AAPL", debounce=True,
+                                  style={"height": 40, "borderRadius": 12, "border": "1px solid #d1d5db", "padding": "0 12px", "minWidth": 160}),
+                        html.Button("Run Analysis", id="run", n_clicks=0, style={"height": 40, "borderRadius": 12, "padding": "0 16px", "border": "none", "background": "#111827", "color": "white", "fontWeight": 600}),
+                    ],
+                ),
+            ],
+        ),
+        html.Div(
+            style={"display": "grid", "gridTemplateColumns": "360px 1fr", "gap": 16},
+            children=[
+                # ---------------- LEFT SIDEBAR: Controls ----------------
+                html.Div(style=card_style, children=[
+                    html.H4("DCF Assumptions", style={"marginTop": 0}),
+                    html.Label("Forecast Years", style=label_style),
+                    dcc.Slider(id="years", min=3, max=10, step=1, value=5, marks={i: str(i) for i in range(3, 11)}),
+
+                    html.Label("WACC (discount rate)", style=label_style),
+                    dcc.Slider(id="wacc", min=0.04, max=0.14, step=0.0025, value=0.09,
+                               marks={0.04: "4%", 0.07: "7%", 0.10: "10%", 0.12: "12%", 0.14: "14%"}),
+
+                    html.Label("Terminal Growth (perpetual)", style=label_style),
+                    dcc.Slider(id="terminal_g", min=0.00, max=0.04, step=0.001, value=0.02,
+                               marks={0.00: "0%", 0.01: "1%", 0.02: "2%", 0.03: "3%", 0.04: "4%"}),
+
+                    html.Label("FCF Growth (yr‑over‑yr)", style=label_style),
+                    dcc.Slider(id="fcf_growth", min=-0.20, max=0.25, step=0.005, value=0.05,
+                               marks={-0.20: "‑20%", -0.10: "‑10%", 0.00: "0%", 0.10: "+10%", 0.25: "+25%"}),
+
+                    html.Hr(),
+                    html.H4("Black‑Scholes Inputs", style={"marginBottom": 8}),
+                    html.Label("Strike (K)", style=label_style),
+                    dcc.Input(id="strike", type="number", value=150, style={"width": "100%", "height": 36, "borderRadius": 10, "border": "1px solid #d1d5db", "padding": "0 10px"}),
+
+                    html.Label("Time to Expiry (years)", style=label_style),
+                    dcc.Slider(id="T", min=0.05, max=2.0, step=0.05, value=1.0, marks={0.25: "0.25y", 0.5: "0.5y", 1.0: "1y", 2.0: "2y"}),
+
+                    html.Label("Risk‑Free Rate (r)", style=label_style),
+                    dcc.Slider(id="rf", min=0.00, max=0.07, step=0.001, value=0.04, marks={0.00: "0%", 0.02: "2%", 0.04: "4%", 0.06: "6%", 0.07: "7%"}),
+
+                    html.Label("Dividend Yield (q)", style=label_style),
+                    dcc.Slider(id="div_yield", min=0.00, max=0.05, step=0.001, value=0.0, marks={0.00: "0%", 0.02: "2%", 0.04: "4%"}),
+
+                    html.Label("Historical Volatility (auto) / Override", style=label_style),
+                    dcc.Slider(id="sigma_override", min=0.0, max=1.00, step=0.005, value=0.0,
+                               marks={0.0: "Auto", 0.10: "10%", 0.20: "20%", 0.40: "40%", 0.60: "60%", 1.00: "100%"}),
+
+                    html.Label("Monte Carlo Simulations", style=label_style),
+                    dcc.Slider(id="n_sims", min=2000, max=40000, step=2000, value=10000,
+                               marks={2000: "2k", 10000: "10k", 20000: "20k", 40000: "40k"}),
+
+                    html.Hr(),
+                    html.H4("Chart Options (TradingView‑like)", style={"marginBottom": 8}),
+                    html.Label("Chart Type", style=label_style),
+                    dcc.Dropdown(id="chart_type", options=[{"label": "Candles", "value": "candle"}, {"label": "Line (Close)", "value": "line"}], value="candle", clearable=False),
+
+                    html.Label("Indicators", style=label_style),
+                    dcc.Checklist(id="indicators", value=["SMA20","SMA50","BBANDS","VWAP","RSI","MACD"],
+                                  options=[
+                                      {"label": "SMA 20", "value": "SMA20"},
+                                      {"label": "SMA 50", "value": "SMA50"},
+                                      {"label": "SMA 200", "value": "SMA200"},
+                                      {"label": "EMA 12", "value": "EMA12"},
+                                      {"label": "EMA 26", "value": "EMA26"},
+                                      {"label": "Bollinger (20,2)", "value": "BBANDS"},
+                                      {"label": "VWAP", "value": "VWAP"},
+                                      {"label": "RSI 14", "value": "RSI"},
+                                      {"label": "MACD (12,26,9)", "value": "MACD"},
+                                      {"label": "ATR 14", "value": "ATR"},
+                                  ]),
+
+                    html.Label("Options", style=label_style),
+                    dcc.Checklist(id="chart_opts", value=["crosshair"], options=[
+                        {"label": "Log scale", "value": "log"},
+                        {"label": "Crosshair & unified hover", "value": "crosshair"},
+                    ]),
+                ]),
+
+                # ---------------- RIGHT: KPIs & Charts ----------------
+                html.Div(children=[
+                    html.Div(
+                        style={"display": "grid", "gridTemplateColumns": "repeat(5, 1fr)", "gap": 12, "marginBottom": 16},
+                        children=[
+                            html.Div(style=card_style, children=[html.Div("Current Price", style={"color": "#64748b"}), html.H3(id="kpi_price", style={"margin": 0})]),
+                            html.Div(style=card_style, children=[html.Div("DCF Value / Share", style={"color": "#64748b"}), html.H3(id="kpi_dcf", style={"margin": 0})]),
+                            html.Div(style=card_style, children=[html.Div("Upside vs Price", style={"color": "#64748b"}), html.H3(id="kpi_upside", style={"margin": 0})]),
+                            html.Div(style=card_style, children=[html.Div("Ann. Volatility", style={"color": "#64748b"}), html.H3(id="kpi_vol", style={"margin": 0})]),
+                            html.Div(style=card_style, children=[html.Div("BS Call / Put", style={"color": "#64748b"}), html.H3(id="kpi_bs", style={"margin": 0})]),
+                        ],
+                    ),
+
+                    html.Div(style=card_style, children=[
+                        html.H4("TradingView‑style Chart"),
+                        dcc.Graph(id="tv_chart", config={"displayModeBar": True}, style={"height": 520}),
+                    ]),
+
+                    html.Div(style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 16, "marginTop": 16}, children=[
+                        html.Div(style=card_style, children=[
+                            html.H4("DCF: Forecast & Discounted FCF"),
+                            dcc.Graph(id="dcf_chart", config={"displayModeBar": False}, style={"height": 320}),
+                            html.Div(id="dcf_msg", style={"color": "#64748b", "fontSize": 12, "marginTop": 6}),
+                        ]),
+                        html.Div(style=card_style, children=[
+                            html.H4("Monte Carlo: 1Y Price Distribution"),
+                            dcc.Graph(id="mc_hist", config={"displayModeBar": False}, style={"height": 320}),
+                        ]),
+                    ]),
+
+                    html.Div(style=card_style, children=[
+                        html.H4("Option Payoff at Expiry"),
+                        dcc.Graph(id="payoff_chart", config={"displayModeBar": False}, style={"height": 320}),
+                    ]),
+                ]),
+            ],
+        ),
+        html.Div(id="hidden_state", style={"display": "none"})
+    ],
+)
+
+# -------------------------------
+# Callbacks
+# -------------------------------
+
+# Auto-prefill parameters when ticker changes (and on first load)
+@app.callback(
+    Output("rf", "value"),
+    Output("div_yield", "value"),
+    Output("strike", "value"),
+    Output("wacc", "value"),
+    Output("fcf_growth", "value"),
+    Input("ticker", "value"),
+    prevent_initial_call=False,
+)
+
+def prefill_params(ticker):
+    if not ticker:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    client = YFClient(ticker)
+    S = client.last_price() or 100.0
+    q = client.dividend_yield()
+    rf = get_risk_free_rate()
+
+    # Beta from prices vs SPY; fallback to info beta; fallback to 1.0
+    beta = None
+    try:
+        mkt = yf.Ticker("SPY").history(period="2y")["Close"].dropna()
+        asset = client.price_history("2y")
+        beta = compute_beta_from_prices(asset, mkt)
+    except Exception:
+        beta = None
+    if beta is None:
+        try:
+            info = client.t.get_info()
+            beta = info.get("beta")
+        except Exception:
+            beta = None
+    if beta is None:
+        beta = 1.0
+
+    # Simple WACC proxy = CAPM (equity‑only) with ERP ~5.5%
+    wacc = float(np.clip(rf + beta * 0.055, 0.04, 0.14))
+
+    # Estimate FCF growth from history
+    g = estimate_fcf_growth_from_history(client.free_cash_flows(), default=0.05)
+
+    return float(rf), float(q), float(S), float(wacc), float(g)
+
+@app.callback(
+    Output("kpi_price", "children"),
+    Output("kpi_dcf", "children"),
+    Output("kpi_upside", "children"),
+    Output("kpi_vol", "children"),
+    Output("kpi_bs", "children"),
+    Output("tv_chart", "figure"),
+    Output("dcf_chart", "figure"),
+    Output("dcf_msg", "children"),
+    Output("mc_hist", "figure"),
+    Output("payoff_chart", "figure"),
+    Input("run", "n_clicks"),
+    Input("ticker", "value"),
+    Input("years", "value"),
+    Input("wacc", "value"),
+    Input("terminal_g", "value"),
+    Input("fcf_growth", "value"),
+    Input("strike", "value"),
+    Input("T", "value"),
+    Input("rf", "value"),
+    Input("div_yield", "value"),
+    Input("sigma_override", "value"),
+    Input("n_sims", "value"),
+    Input("chart_type", "value"),
+    Input("indicators", "value"),
+    Input("chart_opts", "value"),
+    prevent_initial_call=False
+)
+
+def run_analysis(n_clicks, ticker, years, wacc, terminal_g, fcf_growth, K, T, r, q, sigma_override, n_sims, chart_type, indicators, chart_opts):  # reactive callback
+    if not ticker:
+        return ("—", "—", "—", "—", "—", go.Figure(), go.Figure(), "", go.Figure(), go.Figure())
+
+    yf_client = YFClient(ticker)
+
+    # --- Market data ---
+    price_series = yf_client.price_history("5y")
+    S = yf_client.last_price()
+    if S is None or not np.isfinite(S):
+        S = price_series.iloc[-1] if not price_series.empty else np.nan
+
+    # Dividend yield default from data if not set
+    if q is None or (isinstance(q, (int, float)) and q <= 0):
+        q = yf_client.dividend_yield()
+
+    # Volatility estimate
+    auto_sigma = ann_vol_from_history(price_series)
+    sigma = (auto_sigma if (sigma_override is None or sigma_override <= 0) else float(sigma_override)) or 0.25
+
+    # DCF inputs & compute
+    shares = yf_client.shares_outstanding()
+    fcf_hist = yf_client.free_cash_flows()
+    dcf = dcf_valuation(
+        fcf_series=fcf_hist,
+        wacc=float(wacc),
+        terminal_g=float(terminal_g),
+        forecast_years=int(years),
+        fcf_growth=float(fcf_growth) if fcf_growth is not None else None,
+        shares_out=shares,
+    )
+
+    # Black‑Scholes prices
+    call, put = black_scholes(S=float(S), K=float(K), T=float(T), r=float(r), q=float(q), sigma=float(sigma))
+
+    # Monte Carlo terminal price distribution (1Y for display)
+    ST = gbm_terminal_prices(S0=float(S), T=1.0, r=float(r), q=float(q), sigma=float(sigma), n=int(n_sims))
+    p5, p50, p95 = np.percentile(ST, [5, 50, 95])
+
+    # ---------------- KPIs ----------------
+    price_kpi = f"${S:,.2f}" if np.isfinite(S) else "—"
+    dcf_kpi = f"${dcf.per_share_value:,.2f}" if dcf.per_share_value and np.isfinite(dcf.per_share_value) else "—"
+    upside = (dcf.per_share_value / S - 1.0) if dcf.per_share_value and S and S > 0 else None
+    upside_kpi = safe_pct(upside)
+    vol_kpi = safe_pct(sigma)
+    bs_kpi = f"${call:,.2f} / ${put:,.2f}" if np.isfinite(call) and np.isfinite(put) else "—"
+
+    # ---------------- Charts ----------------
+    # TradingView-like chart
+    tv_fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.02)
+    ohlcv = yf_client.ohlcv_history("5y", "1d")
+    inds = indicators or []
+    opts = chart_opts or []
+    if not ohlcv.empty:
+        if (chart_type or "candle") == "candle":
+            tv_fig.add_candlestick(x=ohlcv.index, open=ohlcv["Open"], high=ohlcv["High"], low=ohlcv["Low"], close=ohlcv["Close"], name=ticker, row=1, col=1)
+        else:
+            tv_fig.add_scatter(x=ohlcv.index, y=ohlcv["Close"], mode="lines", name="Close", row=1, col=1)
+        # Volume bars colored by up/down
+        up = ohlcv["Close"] >= ohlcv["Open"]
+        colors = np.where(up, "rgba(38,166,154,0.6)", "rgba(239,83,80,0.6)")
+        tv_fig.add_bar(x=ohlcv.index, y=ohlcv["Volume"], name="Volume", marker_color=colors, row=2, col=1)
+        # Overlays
+        close = ohlcv["Close"]
+        if "SMA20" in inds: tv_fig.add_scatter(x=ohlcv.index, y=sma(close,20), name="SMA20", row=1, col=1)
+        if "SMA50" in inds: tv_fig.add_scatter(x=ohlcv.index, y=sma(close,50), name="SMA50", row=1, col=1)
+        if "SMA200" in inds: tv_fig.add_scatter(x=ohlcv.index, y=sma(close,200), name="SMA200", row=1, col=1)
+        if "EMA12" in inds: tv_fig.add_scatter(x=ohlcv.index, y=ema(close,12), name="EMA12", row=1, col=1)
+        if "EMA26" in inds: tv_fig.add_scatter(x=ohlcv.index, y=ema(close,26), name="EMA26", row=1, col=1)
+        if "BBANDS" in inds:
+            mid, upb, lowb = bbands(close, 20, 2.0)
+            tv_fig.add_scatter(x=ohlcv.index, y=upb, name="BB Upper", line=dict(width=1), row=1, col=1)
+            tv_fig.add_scatter(x=ohlcv.index, y=mid, name="BB Mid", line=dict(width=1), row=1, col=1)
+            tv_fig.add_scatter(x=ohlcv.index, y=lowb, name="BB Lower", line=dict(width=1), row=1, col=1)
+        if "VWAP" in inds:
+            tv_fig.add_scatter(x=ohlcv.index, y=vwap(ohlcv), name="VWAP", row=1, col=1)
+        # Interactions
+        log_scale = "log" if ("log" in opts) else "linear"
+        crosshair = "crosshair" in opts
+        tv_fig.update_yaxes(type=log_scale, row=1, col=1)
+        tv_fig.update_layout(
+            hovermode="x unified" if crosshair else "x",
+            xaxis=dict(
+                showspikes=crosshair, spikemode="across", spikesnap="cursor",
+                rangeslider=dict(visible=True),
+                rangeselector=dict(buttons=[
+                    dict(count=1, label="1M", step="month", stepmode="backward"),
+                    dict(count=3, label="3M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(count=1, label="YTD", step="year", stepmode="todate"),
+                    dict(count=1, label="1Y", step="year", stepmode="backward"),
+                    dict(count=5, label="5Y", step="year", stepmode="backward"),
+                    dict(step="all")
+                ])
+            ),
+            yaxis=dict(showspikes=crosshair, spikemode="across", spikesnap="cursor"),
+            margin=dict(l=10, r=10, t=10, b=0),
+            dragmode="pan",
+            legend=dict(orientation="h", y=1.02, yanchor="bottom"),
+            height=520,
+        )
+    else:
+        tv_fig.update_layout(margin=dict(l=10, r=10, t=10, b=0), height=520)
+
+    # DCF chart
+    dcf_fig = go.Figure()
+    if not dcf.fcf_forecast.empty:
+        df = dcf.fcf_forecast
+        dcf_fig.add_trace(go.Bar(x=df["Year"], y=df["FCF_Forecast"], name="FCF Forecast"))
+        dcf_fig.add_trace(go.Bar(x=df["Year"], y=df["PV_FCF"], name="PV of FCF"))
+        dcf_fig.update_layout(barmode="group", margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Year", yaxis_title="USD")
+    dcf_msg = dcf.message
+
+    # Monte Carlo histogram
+    mc_fig = go.Figure()
+    mc_fig.add_trace(go.Histogram(x=ST, nbinsx=50, name="ST"))
+    mc_fig.add_vline(x=p5, line_dash="dash", annotation_text=f"5%: ${p5:,.0f}")
+    mc_fig.add_vline(x=p50, line_dash="solid", annotation_text=f"Median: ${p50:,.0f}")
+    mc_fig.add_vline(x=p95, line_dash="dash", annotation_text=f"95%: ${p95:,.0f}")
+    mc_fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Price in 1Y (simulated)", yaxis_title="Frequency")
+
+    # Option payoff at expiry (call & put)
+    xs = np.linspace(max(1e-6, 0.1 * S), 2.0 * S, 200)
+    payoff_call = np.maximum(xs - K, 0)
+    payoff_put = np.maximum(K - xs, 0)
+    payoff_fig = go.Figure()
+    payoff_fig.add_trace(go.Scatter(x=xs, y=payoff_call, mode="lines", name="Call Payoff"))
+    payoff_fig.add_trace(go.Scatter(x=xs, y=payoff_put, mode="lines", name="Put Payoff"))
+    payoff_fig.add_vline(x=K, line_dash="dash", annotation_text=f"Strike ${K:,.2f}")
+    payoff_fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Underlying Price at Expiry", yaxis_title="Payoff (undiscounted)")
+
+    return (
+        price_kpi,
+        dcf_kpi,
+        upside_kpi,
+        vol_kpi,
+        bs_kpi,
+        tv_fig,
+        dcf_fig,
+        dcf_msg,
+        mc_fig,
+        payoff_fig,
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
