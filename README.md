@@ -18,7 +18,10 @@ The dashboard is built around four main components of modern finance:
 
 DCF valuation estimates a firm’s intrinsic value by projecting future free cash flows and discounting them back to the present at a rate that reflects risk (often a weighted average cost of capital, WACC).  
 
-If \( FCF_t \) is the forecast free cash flow in year \( t \) and \( r \) is the discount rate, the present value of cash flows over \( T \) years is
+If $FCF_t$ is the forecast free cash flow in year $t$ and $r$ is the discount rate, then
+
+```math
+PV_{\text{FCF}} = \sum_{t=1}^{T} \frac{FCF_t}{(1 + r)^t}
 
 \[
 PV_{\text{FCF}} = \sum_{t=1}^{T} \frac{FCF_t}{(1 + r)^t}.
@@ -146,13 +149,12 @@ Overall, the project serves as a portfolio-ready example of quantitative finance
 
 ## 5. Author
 
-**Author:** *[Your Name]*  
-*Quantitative Finance & Data Science Enthusiast*  
+**Author:** Nail Mammadzada  
+University of Arizona : Stats & Data Science , Finance Dual Degree Student
 
-- GitHub: `https://github.com/<your-github-handle>`  
-- LinkedIn: `https://www.linkedin.com/in/<your-linkedin-handle>/`
+- LinkedIn: `https://www.linkedin.com/in/nailmammadzada/
 
-(Replace the placeholders with your actual information.)
+
 
 ---
 
